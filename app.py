@@ -12,21 +12,29 @@ nest_asyncio.apply()
 
 app = Flask(__name__)
 
-# Memória a /web nézethez
+# Memória a /web nézethez (URL -> talált linkek listája)
 last_hits = {}
 
 def dlog(msg):
-    """Egyedi debug log formátum időbélyeggel a Render konzolba"""
+    """Részletes logolás a Render konzolba"""
     timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] [DEBUG] {msg}")
-    sys.stdout.flush() # Azonnali kiírás a konzolra
+    print(f"[{timestamp}] [JOYN-SCANNER] {msg}")
+    sys.stdout.flush()
 
-async def run_sniffer(target_url, cookies=None, wait_time=45):
+async def run_sniffer(target_url, cookies=None, max_timeout=120):
+    """
+    Addig nyomkodja a gombokat, amíg meg nem érkezik az m3u8 link.
+    max_timeout: 120 másodperc után feladja, ha semmi nem jött.
+    """
     hits = []
-    dlog(f"🚀 Új keresés indítása: {target_url}")
+    start_time = asyncio.get_event_loop().time()
     
+    # Biztosítjuk, hogy legyen lista az URL-hez a memóriában
+    if target_url not in last_hits:
+        last_hits[target_url] = []
+
     async with async_playwright() as p:
-        dlog("🌐 Chromium indítása...")
+        dlog(f"🚀 Böngésző indítása... Cél: {target_url}")
         browser = await p.chromium.launch(
             headless=True, 
             args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
@@ -38,6 +46,7 @@ async def run_sniffer(target_url, cookies=None, wait_time=45):
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
         )
 
+        # Sütik betöltése és Geo-fix
         if cookies:
             cleaned_cookies = []
             for cookie in cookies:
@@ -47,65 +56,70 @@ async def run_sniffer(target_url, cookies=None, wait_time=45):
                 c.pop('storeId', None)
                 cleaned_cookies.append(c)
             await context.add_cookies(cleaned_cookies)
-            dlog(f"🍪 {len(cleaned_cookies)} süti sikeresen betöltve.")
+            dlog(f"🍪 {len(cleaned_cookies)} süti betöltve.")
 
         page = await context.new_page()
 
+        # Hálózati figyelő: amint jön egy m3u8, beleteszi a listába
         def handle_request(req):
             url_low = req.url.lower()
-            if any(x in url_low for x in ["m3u8", "playlist", "playback", "manifest", "master"]):
+            if any(x in url_low for x in ["m3u8", "playlist", "manifest", "master"]):
                 if req.url not in hits:
                     hits.append(req.url)
-                    dlog(f"🎯 TALÁLAT: {req.url[:80]}...") # Csak az elejét logoljuk, hogy ne legyen fal
-                    if target_url in last_hits:
-                        if req.url not in last_hits[target_url]:
-                            last_hits[target_url].append(req.url)
+                    dlog(f"🎯 TALÁLAT! Elkapva: {req.url[:70]}...")
+                    if req.url not in last_hits[target_url]:
+                        last_hits[target_url].append(req.url)
 
         page.on("request", handle_request)
 
         try:
-            dlog(f"📡 Navigálás az oldalra...")
+            dlog("📡 Navigálás az oldalra...")
             await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-            dlog(f"✅ Oldal betöltve (DOM).")
-
-            # --- 1. COOKIE GOMB ---
-            await asyncio.sleep(2)
-            cookie_selectors = [
-                "button:has-text('Alle akzeptieren')",
-                "button:has-text('Zustimmen')",
-                "button:has-text('Akzeptieren')",
-                "#cmp-welcome-confirm-all"
-            ]
             
-            cookie_found = False
-            for selector in cookie_selectors:
-                btn = page.locator(selector).first
-                if await btn.is_visible(timeout=3000):
-                    await btn.click()
-                    dlog(f"🖱️  Cookie gomb megnyomva ({selector})")
-                    cookie_found = True
+            # --- AGRESSZÍV GOMBNYOMKODÓ CIKLUS ---
+            dlog("🔄 Kezdem a 'brute-force' gombnyomkodást...")
+            
+            while len(hits) == 0:
+                elapsed = int(asyncio.get_event_loop().time() - start_time)
+                
+                if elapsed > max_timeout:
+                    dlog(f"⏱️ IDŐTÚLLÉPÉS ({max_timeout}s). Nem sikerült m3u8-at fogni.")
                     break
-            
-            if not cookie_found:
-                dlog("❓ Cookie ablak nem észlelhető (lehet, hogy a sütik már elnyomták).")
 
-            # --- 2. PLAY GOMB ---
-            await asyncio.sleep(3)
-            try:
-                play_btn = page.locator("[data-testid='play-button'], button:has-text('Abspielen')").first
-                if await play_btn.is_visible(timeout=3000):
-                    await play_btn.click()
-                    dlog("▶️  Play gomb megnyomva.")
-            except:
-                dlog("ℹ️ Play gomb nem látható, valószínűleg már fut a lejátszó.")
+                # 1. Cookie gombok (németül)
+                cookie_selectors = [
+                    "button:has-text('Alle akzeptieren')",
+                    "button:has-text('Zustimmen')",
+                    "button:has-text('Akzeptieren')",
+                    "#cmp-welcome-confirm-all",
+                    "button[id*='accept']"
+                ]
+                for sel in cookie_selectors:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.is_visible(timeout=300):
+                            await btn.click(force=True)
+                            dlog(f"[{elapsed}s] 🖱️ Cookie gomb megnyomva!")
+                    except: pass
 
-            dlog(f"⏳ Várakozás a hálózati forgalomra ({wait_time}s)...")
-            await asyncio.sleep(wait_time) 
+                # 2. Play gomb (ha látható)
+                try:
+                    play_btn = page.locator("[data-testid='play-button'], button:has-text('Abspielen')").first
+                    if await play_btn.is_visible(timeout=300):
+                        await play_btn.click(force=True)
+                        dlog(f"[{elapsed}s] ▶️ Play gomb megnyomva!")
+                except: pass
+
+                # Rövid várakozás a következő kör előtt (hogy a JS tudjon futni)
+                await asyncio.sleep(1.5)
+
+            if len(hits) > 0:
+                dlog(f"✨ SIKER! Összesen {len(hits)} linket találtam.")
 
         except Exception as e:
             dlog(f"❌ HIBA: {str(e)}")
         finally:
-            dlog("🧹 Böngésző bezárása, folyamat vége.")
+            dlog("🧹 Böngésző leállítása.")
             await browser.close()
     
     return hits
@@ -115,11 +129,12 @@ async def run_sniffer(target_url, cookies=None, wait_time=45):
 @app.route('/web')
 def web_view():
     url = request.args.get('url')
-    if not url: return "Adj meg egy URL-t!", 400
+    if not url: return "Adj meg egy URL-t: /web?url=...", 400
 
-    if url not in last_hits:
+    # Ha még nem kerestünk rá, indítunk egy taskot
+    if url not in last_hits or not last_hits[url]:
         last_hits[url] = []
-        dlog(f"WEB: Kérés érkezett ide: {url}")
+        dlog(f"WEB-KÉRÉS: {url}")
         asyncio.get_event_loop().create_task(run_sniffer(url))
     
     return render_template_string(HTML_TEMPLATE, url=url, links=last_hits[url])
@@ -131,52 +146,56 @@ def scrape_api():
         data = request.get_json()
         url = data.get('url')
         user_cookies = data.get('cookies', [])
-        dlog(f"API: POST kérés érkezett - {url}")
     else:
         url = request.args.get('url')
-        dlog(f"API: GET kérés érkezett - {url}")
 
     if not url: return jsonify({"status": "error", "message": "Nincs URL"}), 400
     
+    dlog(f"API-KÉRÉS: {url}")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        results = loop.run_until_complete(run_sniffer(url, cookies=user_cookies, wait_time=40))
-        dlog(f"API: Küldöm az eredményeket ({len(results)} db hit).")
-        return jsonify({"status": "success", "hits": [{"url": h} for h in results]})
+        results = loop.run_until_complete(run_sniffer(url, cookies=user_cookies))
+        return jsonify({"status": "success", "hits": results})
     finally:
         loop.close()
 
 @app.route('/')
 def index():
-    dlog("Ping érkezett a főoldalra.")
-    return "JOYN SNIFFER ONLINE."
+    return "JOYN SNIFFER ONLINE. Használd a /web?url=... vagy /scrape útvonalat."
+
+# --- HTML DESIGN ---
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Joyn Monitor</title>
-    <meta http-equiv="refresh" content="5">
+    <title>Joyn Live Monitor</title>
+    <meta http-equiv="refresh" content="3">
     <style>
-        body { background: #000; color: #0f0; font-family: monospace; padding: 20px; }
-        .container { border: 1px solid #0f0; padding: 20px; }
-        .hit { background: #111; border: 1px solid #444; padding: 10px; margin: 10px 0; word-break: break-all; color: #00ff41; }
-        .status { color: #ffcc00; font-weight: bold; }
+        body { background: #050505; color: #00ff41; font-family: 'Courier New', monospace; padding: 20px; }
+        .box { border: 1px solid #00ff41; padding: 20px; background: #0a0a0a; border-radius: 5px; }
+        .hit { background: #111; border: 1px solid #333; padding: 10px; margin: 10px 0; word-break: break-all; font-size: 12px; border-left: 5px solid #00ff41; }
+        .loading { color: orange; animation: blink 1s infinite; font-weight: bold; }
+        @keyframes blink { 0% {opacity:1} 50% {opacity:0.4} 100% {opacity:1} }
+        h1 { color: #fff; text-shadow: 0 0 10px #00ff41; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h2>🛰️ JOYN SNIFFER LOGS</h2>
-        <p>Target: {{ url }}</p>
-        <hr>
+    <div class="box">
+        <h1>🛰️ JOYN TRAFFIC SNIFFER</h1>
+        <p style="color: #888;">Cél URL: {{ url }}</p>
+        <hr style="border: 0.5px solid #222;">
+        
         {% if links %}
-            <p>✅ Talált linkek:</p>
+            <p style="color: #fff;">✅ TALÁLT LINKEK ({{ links|length }} db):</p>
             {% for link in links %}
-                <div class="hit">{{ link }}</div>
+                <div class="hit"><b>[STREAM]:</b> {{ link }}</div>
             {% endfor %}
+            <p style="font-size: 0.8em; color: #555;">(Ha újabb linket akarsz, frissítsd az oldalt paraméter nélkül, majd újra URL-lel.)</p>
         {% else %}
-            <p class="status">📡 KERESÉS FOLYAMATBAN... Ellenőrizd a Render konzolt a részletekért!</p>
+            <p class="loading">📡 KERESÉS FOLYAMATBAN...</p>
+            <p>A szerver éppen próbálja megnyomni a gombokat és elkapni az m3u8 linket. Várj türelemmel, ez 20-60 másodperc is lehet.</p>
         {% endif %}
     </div>
 </body>

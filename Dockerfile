@@ -1,26 +1,32 @@
-# 1. Hivatalos Microsoft Playwright kép használata Python 3.11-gyel (stabilabb, mint a 3.14)
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+# 1. Hivatalos Microsoft Playwright kép (Ubuntu Jammy alapú)
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
-# 2. Munkakönyvtár beállítása a konténeren belül
+# 2. Xvfb és kiegészítő függőségek telepítése (EZ HIÁNYZOTT)
+RUN apt-get update && apt-get install -y \
+    xvfb \
+    libgbm1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Munkakönyvtár beállítása
 WORKDIR /app
 
-# 3. Függőségek másolása (hogy a cache-elés hatékony legyen)
+# 4. Függőségek másolása
 COPY requirements.txt .
 
-# 4. Python csomagok telepítése
+# 5. Python csomagok telepítése
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. A Chromium böngésző és a szükséges rendszerelemek telepítése
-# A Dockerben ez az egyetlen módja, hogy biztosan meglegyen a böngésző
+# 6. Chromium telepítése (a Microsoft képben benne van, de biztosra megyünk)
 RUN playwright install chromium
-RUN playwright install-deps chromium
 
-# 6. A teljes forráskód másolása a konténerbe
+# 7. Forráskód másolása
 COPY . .
 
-# 7. Környezeti változó a Portnak (a Rendernek 10000 kell alapból)
+# 8. Render Port beállítása
 ENV PORT=10000
 EXPOSE 10000
 
-# 8. Az alkalmazás indítása
-CMD ["python", "app.py"]
+# 9. Indítás xvfb-n keresztül
+# Megjegyzés: Ha a Render felületén a "Docker Command"-ba beírod az xvfb-run-t, 
+# az felülbírálja ezt, de jobb, ha itt is benne van alapértelmezettnek.
+CMD ["xvfb-run", "--server-args=-screen 0 1280x720x24", "python", "app.py"]

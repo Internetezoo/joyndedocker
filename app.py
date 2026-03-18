@@ -7,7 +7,7 @@ from datetime import datetime
 from flask import Flask, request, render_template_string, jsonify
 from playwright.async_api import async_playwright
 
-# Engedélyezzük az egymásba ágyazott eseményhurkokat a Flask/Render környezetben
+# Engedélyezzük az egymásba ágyazott eseményhurkokat (Docker/Flask/Async miatt)
 nest_asyncio.apply()
 
 app = Flask(__name__)
@@ -16,14 +16,14 @@ app = Flask(__name__)
 last_hits = {}
 
 def dlog(msg):
-    """Részletes logolás a Render konzolba időbélyeggel"""
+    """Részletes logolás a Render konzolba, hogy lásd a folyamatot"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] [JOYN-SCANNER] {msg}")
     sys.stdout.flush()
 
 async def run_sniffer(target_url, cookies=None, max_timeout=120):
     """
-    Fő motor: Elindítja a böngészőt non-headless módban, 
+    Fő motor: Elindítja a böngészőt non-headless módban (Xvfb-vel), 
     és addig próbálkozik, amíg m3u8 linket nem talál.
     """
     hits = []
@@ -36,17 +36,22 @@ async def run_sniffer(target_url, cookies=None, max_timeout=120):
         dlog("🎭 Böngésző indítása (Xvfb / Non-Headless emuláció)...")
         
         # A headless=False kritikus a blokkolás elkerüléséhez!
-        # Renderen ehhez 'xvfb-run python app.py' indítás kell.
-        browser = await p.chromium.launch(
-            headless=False, 
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--use-gl=swiftshader', 
-                '--window-size=1280,720'
-            ]
-        )
+        # Dockerben ehhez 'xvfb-run' parancs kell az indításkor.
+        try:
+            browser = await p.chromium.launch(
+                headless=False, 
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--use-gl=swiftshader', 
+                    '--window-size=1280,720',
+                    '--mute-audio'
+                ]
+            )
+        except Exception as e:
+            dlog(f"❌ HIBA a böngésző indításakor: {e}")
+            return []
         
         context = await browser.new_context(
             locale="de-DE",
@@ -54,11 +59,11 @@ async def run_sniffer(target_url, cookies=None, max_timeout=120):
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
         )
 
-        # Lopakodó mód: töröljük a webdriver nyomait
+        # Lopakodó mód: töröljük a webdriver nyomait (Bot-védelem ellen)
         page = await context.new_page()
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        # Sütik betöltése (Geo-fix de)
+        # Sütik betöltése (Geo-fix 'de')
         if cookies:
             cleaned_cookies = []
             for cookie in cookies:
@@ -70,7 +75,7 @@ async def run_sniffer(target_url, cookies=None, max_timeout=120):
             await context.add_cookies(cleaned_cookies)
             dlog(f"🍪 {len(cleaned_cookies)} süti betöltve.")
 
-        # Hálózati forgalom figyelése
+        # Hálózati forgalom figyelése (Sniffer)
         def handle_request(req):
             url_low = req.url.lower()
             if any(x in url_low for x in ["m3u8", "playlist", "manifest", "master"]):
@@ -84,10 +89,10 @@ async def run_sniffer(target_url, cookies=None, max_timeout=120):
 
         try:
             dlog(f"📡 Navigálás: {target_url}")
-            # A networkidle megvárja, amíg a háttérfolyamatok lecsillapodnak
+            # Megvárjuk, amíg a hálózat elcsendesedik
             await page.goto(target_url, wait_until="networkidle", timeout=60000)
             
-            dlog("🔄 Kezdem a folyamatos gombnyomkodást...")
+            dlog("🔄 Kezdem az agresszív gombnyomkodást...")
             
             while len(hits) == 0:
                 elapsed = int(asyncio.get_event_loop().time() - start_time)
@@ -105,20 +110,19 @@ async def run_sniffer(target_url, cookies=None, max_timeout=120):
                 for sel in cookie_selectors:
                     try:
                         btn = page.locator(sel).first
-                        if await btn.is_visible(timeout=400):
+                        if await btn.is_visible(timeout=500):
                             await btn.click(force=True)
-                            dlog(f"[{elapsed}s] 🖱️ Cookie leütve!")
+                            dlog(f"[{elapsed}s] 🖱️ Cookie OK!")
                     except: pass
 
                 # --- 2. PLAY GOMB ---
                 try:
                     play_btn = page.locator("[data-testid='play-button'], button:has-text('Abspielen')").first
-                    if await play_btn.is_visible(timeout=400):
+                    if await play_btn.is_visible(timeout=500):
                         await play_btn.click(force=True)
-                        dlog(f"[{elapsed}s] ▶️ Play megnyomva!")
+                        dlog(f"[{elapsed}s] ▶️ Play OK!")
                 except: pass
 
-                # Rövid szünet a ciklusban a CPU kímélése érdekében
                 await asyncio.sleep(2)
 
             if hits:
@@ -136,24 +140,24 @@ async def run_sniffer(target_url, cookies=None, max_timeout=120):
 
 @app.route('/')
 def index():
-    return "JOYN SNIFFER MŰKÖDIK. Használd: /web?url=... vagy /scrape?url=..."
+    return "JOYN SNIFFER ONLINE. Port: 10000 | Host: 0.0.0.0"
 
 @app.route('/web')
 def web_view():
     """Böngészős monitor felület"""
     url = request.args.get('url')
-    if not url: return "Hiba: Adj meg egy URL-t a böngészőben! (/web?url=...)", 400
+    if not url: return "Adj meg egy URL-t! (/web?url=...)", 400
 
     if url not in last_hits or not last_hits[url]:
         last_hits[url] = []
-        dlog(f"WEB-KÉRÉS INDÍTVA: {url}")
+        dlog(f"WEB-KÉRÉS: {url}")
         asyncio.get_event_loop().create_task(run_sniffer(url))
     
     return render_template_string(HTML_TEMPLATE, url=url, links=last_hits[url])
 
 @app.route('/scrape', methods=['GET', 'POST'])
 def scrape_api():
-    """API végpont JSON válaszhoz"""
+    """API végpont JSON válaszhoz (GET teszteléshez, POST automatizáláshoz)"""
     user_cookies = []
     url = None
 
@@ -170,7 +174,6 @@ def scrape_api():
     
     dlog(f"API-KÉRÉS ({request.method}): {url}")
     
-    # Új loop az API híváshoz, hogy megvárja a végét
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -188,26 +191,25 @@ HTML_TEMPLATE = """
     <title>Joyn Monitor</title>
     <meta http-equiv="refresh" content="5">
     <style>
-        body { background: #000; color: #00ff41; font-family: monospace; padding: 20px; }
-        .box { border: 1px solid #00ff41; padding: 20px; border-radius: 5px; background: #050505; }
-        .hit { background: #111; border: 1px solid #333; padding: 10px; margin: 10px 0; word-break: break-all; font-size: 11px; border-left: 4px solid #00ff41; }
-        .loading { color: #ffcc00; animation: blink 1s infinite; font-weight: bold; }
+        body { background: #000; color: #00ff41; font-family: 'Courier New', monospace; padding: 20px; }
+        .box { border: 1px solid #00ff41; padding: 20px; background: #050505; border-radius: 5px; }
+        .hit { background: #111; border: 1px solid #333; padding: 10px; margin: 10px 0; word-break: break-all; color: cyan; border-left: 4px solid #00ff41; }
+        .loading { color: #ffcc00; animation: blink 1s infinite; }
         @keyframes blink { 0% {opacity:1} 50% {opacity:0.3} 100% {opacity:1} }
     </style>
 </head>
 <body>
     <div class="box">
-        <h2>🛰️ JOYN TRAFFIC SNIFFER (XVFB)</h2>
+        <h2>🛰️ JOYN SCANNER (XVFB DOCKER)</h2>
         <p>Target: {{ url }}</p>
-        <hr style="border-color: #222;">
+        <hr>
         {% if links %}
-            <p>✅ TALÁLT STREAMEK:</p>
+            <p>✅ TALÁLT M3U8 LINKEK:</p>
             {% for link in links %}
                 <div class="hit">{{ link }}</div>
             {% endfor %}
         {% else %}
-            <p class="loading">📡 KERESÉS ÉS GOMBNYOMKODÁS... VÁRJ...</p>
-            <p style="font-size: 0.8em; color: #666;">A szerver éppen próbálja elindítani a lejátszót Frankfurtban.</p>
+            <p class="loading">📡 KERESÉS... A BÖNGÉSZŐ NYOMKODJA A GOMBOKAT...</p>
         {% endif %}
     </div>
 </body>
@@ -215,6 +217,7 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == '__main__':
+    # RENDKÍVÜL FONTOS: host='0.0.0.0', különben a Render nem látja!
     port = int(os.environ.get("PORT", 10000))
-    dlog(f"Szerver indul a {port} porton...")
-    app.run(host='0.0.0.0', port=port)
+    dlog(f"Szerver indul: http://0.0.0.0:{port}")
+    app.run(host='0.0.0.0', port=port, debug=False)

@@ -6,7 +6,6 @@ from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 
-# Globális változó az eredmény tárolására
 found_data = {"m3u8": None, "status": "Idle", "last_error": None}
 
 def run_scraper():
@@ -14,31 +13,30 @@ def run_scraper():
     found_data["status"] = "Running"
     target_url = "https://www.joyn.de/play/serien/die-waltons/1-1-das-findelkind"
     
-    print("[*] Böngésző indítása...")
+    print("[*] Böngésző indítása (Low-RAM mód)...")
     with sync_playwright() as p:
         try:
-            # Render/Docker specifikus beállítások
             browser = p.chromium.launch(
                 headless=True, 
                 args=[
                     "--no-sandbox", 
                     "--disable-setuid-sandbox", 
-                    "--disable-dev-shm-usage",
-                    "--mute-audio"
+                    "--disable-dev-shm-usage", # Fontos Dockerben!
+                    "--disable-gpu",           # Spórol a RAM-mal
+                    "--js-flags='--max-old-space-size=256'" # Korlátozza a JS memóriaigényét
                 ]
             )
             
-            # Német nyelv és normál User Agent beállítása
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
                 locale="de-DE"
             )
             
             page = context.new_page()
-            page.set_viewport_size({"width": 1280, "height": 720})
+            # Kisebb felbontás = kevesebb RAM
+            page.set_viewport_size({"width": 1024, "height": 768})
 
             def handle_response(response):
-                # Joyn manifest URL keresése a hálózati forgalomban
                 if "playlist" in response.url and response.request.method == "POST":
                     if response.status == 200:
                         try:
@@ -47,74 +45,54 @@ def run_scraper():
                             if url:
                                 found_data["m3u8"] = url
                                 print(f"\n[!!!] SIKER: {url}")
-                        except:
-                            pass
+                        except: pass
 
             page.on("response", handle_response)
             
             print(f"[*] Navigálás: {target_url}")
-            page.goto(target_url, wait_until="networkidle", timeout=60000)
+            page.goto(target_url, wait_until="commit", timeout=90000)
 
             start_time = time.time()
             while not found_data["m3u8"]:
                 elapsed = int(time.time() - start_time)
                 
-                # 1. Cookie elfogadása (ha megjelenik)
+                # Próbálunk kattintani, ha betöltődött valami
                 try:
-                    cookie_btn = page.locator("button.button--primary.button--animated").first
-                    if cookie_btn.count() > 0 and cookie_btn.is_visible():
-                        cookie_btn.click(force=True, timeout=1000)
-                        print(f"[{elapsed}s] Cookie elfogadva.")
-                except:
-                    pass
+                    # Joyn cookie gomb selector
+                    page.click("button[id*='cmp-parent']", timeout=2000) 
+                except: pass
 
-                # 2. Play gomb megnyomása
                 try:
-                    play_btn = page.locator("[data-testid='play-button']").first
-                    if play_btn.count() > 0 and play_btn.is_visible():
-                        play_btn.click(force=True, timeout=1000)
-                        print(f"[{elapsed}s] Play megnyomva.")
-                except:
-                    pass
+                    page.click("[data-testid='play-button']", timeout=2000)
+                except: pass
 
-                # Timeout 5 perc után
                 if elapsed > 300:
                     found_data["status"] = "Timeout"
                     break
-                
-                time.sleep(2)
+                time.sleep(5)
 
-            if found_data["m3u8"]:
-                found_data["status"] = "Completed"
-            
             browser.close()
+            found_data["status"] = "Completed" if found_data["m3u8"] else "Failed"
 
         except Exception as e:
             print(f"[HIBA]: {str(e)}")
             found_data["status"] = "Error"
             found_data["last_error"] = str(e)
 
-# --- FLASK ROUTES ---
-
 @app.route('/')
 def health_check():
-    """A Render ezen keresztül ellenőrzi, hogy fut-e az app."""
-    return jsonify({
-        "message": "Joyn Scraper is alive",
-        "current_status": found_data["status"],
-        "result": found_data["m3u8"]
-    }), 200
+    return jsonify(found_data), 200
 
 @app.route('/start')
 def start_bot():
-    """Kézi indítás a /start URL-en keresztül."""
-    if found_data["status"] != "Running":
+    # Csak akkor indítjuk, ha nem fut
+    if found_data["status"] not in ["Running"]:
         thread = threading.Thread(target=run_scraper)
         thread.start()
-        return "Scraper started in background...", 202
-    return "Scraper is already running.", 200
+        return "Scraper elindítva a háttérben...", 202
+    return "A scraper már fut!", 200
 
 if __name__ == "__main__":
-    # Render automatikusan adja a PORT környezeti változót
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    # Threaded=True segít a Flask-nek kezelni a kéréseket a scrapper mellett
+    app.run(host='0.0.0.0', port=port, threaded=True)

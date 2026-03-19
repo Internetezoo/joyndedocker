@@ -1,18 +1,27 @@
-# Hivatalos Playwright kép, amiben benne van a Python és a böngésző függőségek is
+# 1. Hivatalos Playwright kép használata (tartalmazza a Python-t és a böngésző függőségeket)
 FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
-# Munkakönyvtár beállítása
+# 2. Munkakönyvtár létrehozása a konténeren belül
 WORKDIR /app
 
-# Függőségek másolása és telepítése
+# 3. Környezeti változók beállítása a stabilabb futáshoz
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# 4. Függőségek másolása és telepítése
+# A requirements.txt-ben legyen benne: flask, playwright, gunicorn
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Böngészők telepítése (ha a képben nem lenne elég)
+# 5. A böngésző binárisok telepítése (csak a Chromium-ot telepítjük a helytakarékosság miatt)
 RUN playwright install chromium
 
-# Kód másolása
+# 6. A teljes forráskód másolása a munkakönyvtárba
 COPY . .
 
-# Indítás
-CMD ["python", "app.py"]
+# 7. Port expose (Render alapértelmezett portja)
+EXPOSE 10000
+
+# 8. Indítás Gunicorn-nal (app.py fájlban lévő app objektum indítása)
+# A --timeout 0 fontos, mert a Playwright műveletek hosszú ideig tarthatnak
+CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--timeout", "0", "app:app"]

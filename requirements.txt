@@ -1,4 +1,1 @@
-flask
 playwright
-nest_asyncio
-requests

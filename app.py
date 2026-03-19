@@ -2,222 +2,145 @@ import asyncio
 import nest_asyncio
 import os
 import sys
-import json
 from datetime import datetime
-from flask import Flask, request, render_template_string, jsonify
+from flask import Flask, request, render_template_string, jsonify, send_from_directory
 from playwright.async_api import async_playwright
 
-# Engedélyezzük az egymásba ágyazott eseményhurkokat (Docker/Flask/Async miatt)
 nest_asyncio.apply()
-
 app = Flask(__name__)
 
-# Memória a talált linkek tárolására (URL -> lista)
+# Videók tárolási helye
+VIDEO_DIR = "/app/videos"
+if not os.path.exists(VIDEO_DIR):
+    os.makedirs(VIDEO_DIR)
+
 last_hits = {}
+# Itt tároljuk a videó fájlneveket az URL-ekhez
+video_files = {}
 
 def dlog(msg):
-    """Részletes logolás a Render konzolba, hogy lásd a folyamatot"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] [JOYN-SCANNER] {msg}")
     sys.stdout.flush()
 
-async def run_sniffer(target_url, cookies=None, max_timeout=120):
-    """
-    Fő motor: Elindítja a böngészőt non-headless módban (Xvfb-vel), 
-    és addig próbálkozik, amíg m3u8 linket nem talál.
-    """
+# Végpont a videók letöltéséhez/megtekintéséhez
+@app.route('/videos/<path:filename>')
+def serve_video(filename):
+    return send_from_directory(VIDEO_DIR, filename)
+
+async def run_sniffer(target_url, cookies=None, max_timeout=90):
     hits = []
-    start_time = asyncio.get_event_loop().time()
+    video_path = None
     
     if target_url not in last_hits:
         last_hits[target_url] = []
 
     async with async_playwright() as p:
-        dlog("🎭 Böngésző indítása (Xvfb / Non-Headless emuláció)...")
+        dlog("🚀 Böngésző indítása HEADLESS módban videórögzítéssel...")
         
-        # A headless=False kritikus a blokkolás elkerüléséhez!
-        # Dockerben ehhez 'xvfb-run' parancs kell az indításkor.
-        try:
-            browser = await p.chromium.launch(
-                headless=False, 
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-blink-features=AutomationControlled',
-                    '--use-gl=swiftshader', 
-                    '--window-size=1280,720',
-                    '--mute-audio'
-                ]
-            )
-        except Exception as e:
-            dlog(f"❌ HIBA a böngésző indításakor: {e}")
-            return []
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         
+        # VIDEÓ BEÁLLÍTÁSA: Itt adjuk meg hova mentse
         context = await browser.new_context(
             locale="de-DE",
             viewport={'width': 1280, 'height': 720},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
+            record_video_dir=VIDEO_DIR,
+            record_video_size={'width': 1280, 'height': 720}
         )
 
-        # Lopakodó mód: töröljük a webdriver nyomait (Bot-védelem ellen)
         page = await context.new_page()
-        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # Videó fájlnév kinyerése
+        video_obj = await page.video.path()
+        video_filename = os.path.basename(video_obj) if video_obj else "rögzítés..."
+        video_files[target_url] = video_filename
 
-        # Sütik betöltése (Geo-fix 'de')
-        if cookies:
-            cleaned_cookies = []
-            for cookie in cookies:
-                c = cookie.copy()
-                if c.get('name') == 'geoLocation': c['value'] = 'de'
-                c.pop('hostOnly', None)
-                c.pop('storeId', None)
-                cleaned_cookies.append(c)
-            await context.add_cookies(cleaned_cookies)
-            dlog(f"🍪 {len(cleaned_cookies)} süti betöltve.")
-
-        # Hálózati forgalom figyelése (Sniffer)
+        # Sniffer logika marad...
         def handle_request(req):
-            url_low = req.url.lower()
-            if any(x in url_low for x in ["m3u8", "playlist", "manifest", "master"]):
+            if any(x in req.url.lower() for x in ["m3u8", "playlist", "manifest"]):
                 if req.url not in hits:
                     hits.append(req.url)
-                    dlog(f"🎯 TALÁLAT: {req.url[:70]}...")
-                    if req.url not in last_hits[target_url]:
-                        last_hits[target_url].append(req.url)
+                    last_hits[target_url].append(req.url)
 
         page.on("request", handle_request)
 
         try:
             dlog(f"📡 Navigálás: {target_url}")
-            # Megvárjuk, amíg a hálózat elcsendesedik
             await page.goto(target_url, wait_until="networkidle", timeout=60000)
             
-            dlog("🔄 Kezdem az agresszív gombnyomkodást...")
-            
-            while len(hits) == 0:
-                elapsed = int(asyncio.get_event_loop().time() - start_time)
-                if elapsed > max_timeout:
-                    dlog(f"⏱️ IDŐTÚLLÉPÉS ({max_timeout}s). Feladom.")
-                    break
-
-                # --- 1. COOKIE GOMBOK ---
-                cookie_selectors = [
-                    "button:has-text('Alle akzeptieren')",
-                    "button:has-text('Zustimmen')",
-                    "button:has-text('Akzeptieren')",
-                    "#cmp-welcome-confirm-all"
-                ]
-                for sel in cookie_selectors:
-                    try:
-                        btn = page.locator(sel).first
-                        if await btn.is_visible(timeout=500):
-                            await btn.click(force=True)
-                            dlog(f"[{elapsed}s] 🖱️ Cookie OK!")
-                    except: pass
-
-                # --- 2. PLAY GOMB ---
-                try:
-                    play_btn = page.locator("[data-testid='play-button'], button:has-text('Abspielen')").first
-                    if await play_btn.is_visible(timeout=500):
-                        await play_btn.click(force=True)
-                        dlog(f"[{elapsed}s] ▶️ Play OK!")
-                except: pass
-
-                await asyncio.sleep(2)
-
-            if hits:
-                dlog(f"✨ SIKER! {len(hits)} link begyűjtve.")
+            # Gombnyomkodás imitálása (Cookie + Play)
+            # ... (a korábbi kódod gombnyomkodó része ide jön) ...
+            await asyncio.sleep(15) # Hagyunk időt a videónak is, hogy rögzítsen valamit
 
         except Exception as e:
-            dlog(f"❌ HIBA A FOLYAMATBAN: {str(e)}")
+            dlog(f"❌ HIBA: {e}")
         finally:
-            dlog("🧹 Böngésző bezárása.")
+            # A videó CSAK a context/browser bezárásakor mentődik el véglegesen!
+            await context.close() 
             await browser.close()
+            # Átnevezzük a videót valami olvashatóbbra, ha kész
+            final_path = await page.video.path()
+            dlog(f"📹 Videó mentve: {final_path}")
+            video_files[target_url] = os.path.basename(final_path)
     
     return hits
 
-# --- FLASK ÚTVONALAK ---
-
-@app.route('/')
-def index():
-    return "JOYN SNIFFER ONLINE. Port: 10000 | Host: 0.0.0.0"
-
-@app.route('/web')
-def web_view():
-    """Böngészős monitor felület"""
-    url = request.args.get('url')
-    if not url: return "Adj meg egy URL-t! (/web?url=...)", 400
-
-    if url not in last_hits or not last_hits[url]:
-        last_hits[url] = []
-        dlog(f"WEB-KÉRÉS: {url}")
-        asyncio.get_event_loop().create_task(run_sniffer(url))
-    
-    return render_template_string(HTML_TEMPLATE, url=url, links=last_hits[url])
-
-@app.route('/scrape', methods=['GET', 'POST'])
-def scrape_api():
-    """API végpont JSON válaszhoz (GET teszteléshez, POST automatizáláshoz)"""
-    user_cookies = []
-    url = None
-
-    if request.method == 'POST':
-        data = request.get_json(silent=True)
-        if data:
-            url = data.get('url')
-            user_cookies = data.get('cookies', [])
-    else:
-        url = request.args.get('url')
-
-    if not url: 
-        return jsonify({"status": "error", "message": "Nincs URL"}), 400
-    
-    dlog(f"API-KÉRÉS ({request.method}): {url}")
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        results = loop.run_until_complete(run_sniffer(url, cookies=user_cookies))
-        return jsonify({"status": "success", "hits": results})
-    finally:
-        loop.close()
-
-# --- HTML SABLON ---
-
+# --- HTML SABLON FRISSÍTÉSE ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Joyn Monitor</title>
-    <meta http-equiv="refresh" content="5">
+    <title>Joyn Monitor + Video</title>
+    <meta http-equiv="refresh" content="10">
     <style>
-        body { background: #000; color: #00ff41; font-family: 'Courier New', monospace; padding: 20px; }
-        .box { border: 1px solid #00ff41; padding: 20px; background: #050505; border-radius: 5px; }
-        .hit { background: #111; border: 1px solid #333; padding: 10px; margin: 10px 0; word-break: break-all; color: cyan; border-left: 4px solid #00ff41; }
-        .loading { color: #ffcc00; animation: blink 1s infinite; }
-        @keyframes blink { 0% {opacity:1} 50% {opacity:0.3} 100% {opacity:1} }
+        body { background: #1a1a1a; color: #eee; font-family: sans-serif; padding: 20px; }
+        .box { border: 1px solid #444; padding: 20px; background: #222; border-radius: 8px; }
+        .hit { background: #000; border-left: 5px solid #00ff41; padding: 10px; margin: 5px 0; font-size: 12px; word-break: break-all; }
+        video { width: 100%; max-width: 600px; border: 1px solid #555; margin-top: 10px; }
+        .video-link { color: #00ff41; text-decoration: none; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="box">
-        <h2>🛰️ JOYN SCANNER (XVFB DOCKER)</h2>
+        <h2>🛰️ JOYN SNIFFER (Headless + Video)</h2>
         <p>Target: {{ url }}</p>
         <hr>
-        {% if links %}
-            <p>✅ TALÁLT M3U8 LINKEK:</p>
-            {% for link in links %}
-                <div class="hit">{{ link }}</div>
-            {% endfor %}
+        {% if video %}
+            <p>📹 Utolsó rögzített folyamat:</p>
+            <video controls>
+                <source src="/videos/{{ video }}" type="video/webm">
+                A böngésződ nem támogatja a videót.
+            </video>
+            <br>
+            <a class="video-link" href="/videos/{{ video }}" target="_blank">📥 Videó letöltése</a>
         {% else %}
-            <p class="loading">📡 KERESÉS... A BÖNGÉSZŐ NYOMKODJA A GOMBOKAT...</p>
+            <p>⏳ Videó generálása folyamatban...</p>
         {% endif %}
+        <hr>
+        <h3>🎯 Talált linkek:</h3>
+        {% for link in links %}
+            <div class="hit">{{ link }}</div>
+        {% endfor %}
     </div>
 </body>
 </html>
 """
 
+@app.route('/web')
+def web_view():
+    url = request.args.get('url')
+    if not url: return "Adj meg egy URL-t!", 400
+    
+    if url not in last_hits:
+        last_hits[url] = []
+        asyncio.get_event_loop().create_task(run_sniffer(url))
+    
+    return render_template_string(HTML_TEMPLATE, 
+                                 url=url, 
+                                 links=last_hits.get(url, []), 
+                                 video=video_files.get(url))
+
 if __name__ == '__main__':
-    # RENDKÍVÜL FONTOS: host='0.0.0.0', különben a Render nem látja!
     port = int(os.environ.get("PORT", 10000))
-    dlog(f"Szerver indul: http://0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port)

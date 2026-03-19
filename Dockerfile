@@ -15,4 +15,4 @@ RUN playwright install chromium
 COPY . .
 
 # Indítás
-CMD ["python", "chrome_headless.py"]
+CMD ["python", "app.py"]
